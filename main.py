@@ -134,6 +134,30 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+# --- 自動切断処理（メンバーが全員いなくなったら切断） ---
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # 状態が変わったチャンネルを取得
+    voice_state = before if before.channel else after
+    if not voice_state or not voice_state.channel:
+        return
+
+    channel = voice_state.channel
+    guild = channel.guild
+    voice_client = guild.voice_client
+
+    # BotがそのVCに参加しているか確認
+    if voice_client and voice_client.channel.id == channel.id:
+        # Bot以外の人間（BotフラグがFalseのメンバー）をカウント
+        human_members = [m for m in channel.members if not m.bot]
+        
+        # 人間が0人になったら切断
+        if len(human_members) == 0:
+            await voice_client.disconnect()
+            logger.info(f"チャンネル『{channel.name}』から全員が退出したため、Botが自動切断しました。")
+
+
 # --- VC参加・切断の共通処理 ---
 
 async def join_vc_logic(member: discord.Member, guild: discord.Guild) -> str:
