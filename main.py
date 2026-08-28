@@ -1,6 +1,8 @@
 import os
 import logging
 import sys
+import io
+import aiohttp
 
 import discord
 from discord import app_commands
@@ -16,6 +18,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+VOICEVOX_URL = os.getenv("VOICEVOX_URL")  # Renderに設定したngrokのURL
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN が .env に設定されていません。")
@@ -51,6 +54,46 @@ bot = MyBot(
 )
 
 
+# --- VOICEVOX 音声生成処理 ---
+
+async def generate_voice(text: str) -> io.BytesIO | None:
+    if not VOICEVOX_URL:
+        logger.error("VOICEVOX_URL が設定されていません。")
+        return None
+
+    # ngrokの初回警告ページを回避するヘッダーを設定
+    headers = {"ngrok-skip-browser-warning": "true"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. 音声合成用のクエリを作成 (3は「ずんだもん (ノーマル)」)
+            async with session.post(
+                f"{VOICEVOX_URL}/audio_query",
+                params={"text": text, "speaker": 3},
+                headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("VOICEVOX Audio Query Failed: %s", resp.status)
+                    return None
+                query_data = await resp.json()
+
+            # 2. 音声データを生成
+            async with session.post(
+                f"{VOICEVOX_URL}/synthesis",
+                params={"speaker": 3},
+                json=query_data,
+                headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("VOICEVOX Synthesis Failed: %s", resp.status)
+                    return None
+                voice_bytes = await resp.read()
+                return io.BytesIO(voice_bytes)
+    except Exception as e:
+        logger.exception("VOICEVOX との通信に失敗しました: %s", e)
+        return None
+
+
 @bot.event
 async def on_ready():
     try:
@@ -59,6 +102,36 @@ async def on_ready():
         logger.info("App commands synced.")
     except Exception as e:
         logger.exception("Failed to sync app commands: %s", e)
+
+
+# --- メッセージ受信・自動読み上げ処理 ---
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Bot自身の発言やコマンド(!で始まるもの)は読み上げない
+    if message.author.bot or message.content.startswith("!"):
+        return
+
+    # サーバー内のVC状態を確認
+    voice_client = message.guild.voice_client if message.guild else None
+
+    # BotがVCに参加していて、再生中でない場合
+    if voice_client and voice_client.is_connected():
+        # メッセージ送信者がBotと同じVCに入っているかチェック
+        if message.author.voice and message.author.voice.channel.id == voice_client.channel.id:
+            # 音声ファイルを生成
+            audio_stream = await generate_voice(message.content)
+            if audio_stream:
+                try:
+                    # FFmpegを使ってDiscordで音声再生
+                    source = discord.FFmpegPCMAudio(audio_stream, pipe=True)
+                    if not voice_client.is_playing():
+                        voice_client.play(source)
+                except Exception as e:
+                    logger.exception("音声再生に失敗しました: %s", e)
+
+    # コマンドの実行処理を継続
+    await bot.process_commands(message)
 
 
 # --- VC参加・切断の共通処理 ---
@@ -95,7 +168,7 @@ async def leave_vc_logic(guild: discord.Guild) -> str:
 
 @bot.command(name="join")
 async def join_command(ctx: commands.Context):
-    if not ctx.guild:
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
         return
     res = await join_vc_logic(ctx.author, ctx.guild)
     await ctx.send(res)
