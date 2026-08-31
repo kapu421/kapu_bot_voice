@@ -80,7 +80,7 @@ async def generate_voice(text: str) -> io.BytesIO | None:
             # 2. 音声データを生成
             async with session.post(
                 f"{VOICEVOX_URL}/synthesis",
-                params={"speaker": 3},
+                params={"speaker": 42},
                 json=query_data,
                 headers=headers
             ) as resp:
