@@ -24,12 +24,12 @@ if not BOT_TOKEN:
     logger.error("BOT_TOKEN が .env に設定されていません。")
     sys.exit("BOT_TOKEN is required in .env")
 
-# インテントの設定（VC状態とメッセージコンテンツを取得）
+# インテントの設定
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-# --- プロキシ設定 (Webshare等のHTTP/HTTPSプロキシ用) ---
+# --- プロキシ設定 ---
 USE_PROXY = os.getenv("USE_PROXY", "false").lower() in ("true", "1", "yes")
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -43,7 +43,7 @@ if USE_PROXY:
 else:
     logger.info("プロキシなしでDiscordに接続します。")
 
-# VOICEVOX スピーカーリスト (名前: ID)
+# VOICEVOX スピーカーリスト
 SPEAKERS = {
     "四国めたん（ノーマル）": 2,
     "四国めたん（あまあま）": 0,
@@ -98,7 +98,6 @@ SPEAKERS = {
     "ナースロボ＿タイプＴ（内緒話）": 50,
 }
 
-# ユーザーごとの選択スピーカー設定 (user_id: speaker_id)
 user_speaker_map = {}
 
 
@@ -108,7 +107,6 @@ class MyBot(commands.Bot):
         self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
-        # 通信セッションを使い回すため保持
         self.session = aiohttp.ClientSession()
 
     async def close(self):
@@ -125,6 +123,22 @@ bot = MyBot(
 )
 
 
+# --- VOICEVOX 接続チェック ---
+
+async def check_voicevox_status() -> bool:
+    """VOICEVOX (ngrok) が起動しているか確認する関数"""
+    if not VOICEVOX_URL or not bot.session:
+        return False
+    
+    headers = {"ngrok-skip-browser-warning": "true"}
+    try:
+        # バージョン確認用APIを叩いて接続確認
+        async with bot.session.get(f"{VOICEVOX_URL}/version", headers=headers, timeout=5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 # --- VOICEVOX 音声生成処理 ---
 
 async def generate_voice(text: str, speaker_id: int) -> io.BytesIO | None:
@@ -135,7 +149,6 @@ async def generate_voice(text: str, speaker_id: int) -> io.BytesIO | None:
     headers = {"ngrok-skip-browser-warning": "true"}
 
     try:
-        # 1. 音声合成用のクエリを作成
         async with bot.session.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"text": text, "speaker": speaker_id},
@@ -146,7 +159,6 @@ async def generate_voice(text: str, speaker_id: int) -> io.BytesIO | None:
                 return None
             query_data = await resp.json()
 
-        # 2. 音声データを生成
         async with bot.session.post(
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": speaker_id},
@@ -185,7 +197,6 @@ async def on_message(message: discord.Message):
 
     if voice_client and voice_client.is_connected():
         if message.author.voice and message.author.voice.channel.id == voice_client.channel.id:
-            # ユーザーが指定した話者IDを取得（デフォルトは「ずんだもん (ノーマル): 3」）
             speaker_id = user_speaker_map.get(message.author.id, 3)
             
             audio_stream = await generate_voice(message.content, speaker_id)
@@ -219,43 +230,81 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             logger.info(f"チャンネル『{channel.name}』から全員が退出したため、Botが自動切断しました。")
 
 
-# --- VC参加・切断の共通処理 ---
+# --- VC参加・切断の共通処理（Embed生成） ---
 
-async def join_vc_logic(member: discord.Member, guild: discord.Guild) -> str:
+async def join_vc_logic(member: discord.Member, guild: discord.Guild) -> discord.Embed:
     if not member.voice or not member.voice.channel:
-        return "先にボイスチャンネルに入ってからコマンドを実行してください。"
+        embed = discord.Embed(
+            title="エラー",
+            description="先にボイスチャンネルに入ってからコマンドを実行してください。",
+            color=discord.Color.red()
+        )
+        return embed
 
     target_channel = member.voice.channel
+
+    # VOICEVOX ngrokの起動チェック
+    is_vv_active = await check_voicevox_status()
+    if not is_vv_active:
+        embed = discord.Embed(
+            title="VOICEVOX接続エラー",
+            description="VOICEVOX.NGROKが実行されていません。\n開発者(kapu)に連絡してください。",
+            color=discord.Color.red()
+        )
+        return embed
+
     voice_client = guild.voice_client
 
     if voice_client:
         if voice_client.channel.id == target_channel.id:
-            return f"すでに『{target_channel.name}』に参加しています。"
+            embed = discord.Embed(
+                title="ボイスチャンネル参加",
+                description=f"すでに『{target_channel.name}』に参加しています。",
+                color=discord.Color.blue()
+            )
         else:
             await voice_client.move_to(target_channel)
-            return f"『{target_channel.name}』に移動しました！"
+            embed = discord.Embed(
+                title="ボイスチャンネル移動",
+                description=f"『{target_channel.name}』に移動しました！",
+                color=discord.Color.blue()
+            )
     else:
         await target_channel.connect()
-        return f"『{target_channel.name}』に参加しました！"
+        embed = discord.Embed(
+            title="ボイスチャンネル参加",
+            description=f"『{target_channel.name}』に参加しました！",
+            color=discord.Color.blue()
+        )
+
+    return embed
 
 
-async def leave_vc_logic(guild: discord.Guild) -> str:
+async def leave_vc_logic(guild: discord.Guild) -> discord.Embed:
     voice_client = guild.voice_client
     if voice_client:
         channel_name = voice_client.channel.name
         await voice_client.disconnect()
-        return f"『{channel_name}』から切断しました。"
+        embed = discord.Embed(
+            title="ボイスチャンネル終了",
+            description=f"『{channel_name}』から切断しました。",
+            color=discord.Color.blue()
+        )
     else:
-        return "ボットはどのボイスチャンネルにも参加していません。"
+        embed = discord.Embed(
+            title="エラー",
+            description="ボットはどのボイスチャンネルにも参加していません。",
+            color=discord.Color.red()
+        )
+    return embed
 
 
-# --- 声（キャラクター）変更機能の追加 ---
+# --- 声（キャラクター）変更機能 ---
 
 async def speaker_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ) -> list[app_commands.Choice[str]]:
-    # 候補の一致検索（最大25個まで表示）
     choices = [
         app_commands.Choice(name=name, value=name)
         for name in SPEAKERS.keys()
@@ -273,19 +322,36 @@ async def set_speaker_slash(interaction: discord.Interaction, name: str):
 
     speaker_id = SPEAKERS[name]
     user_speaker_map[interaction.user.id] = speaker_id
-    await interaction.response.send_message(f"読み上げキャラクターを**『{name}』**に変更しました！")
+    
+    embed = discord.Embed(
+        title="キャラクター変更完了",
+        description=f"読み上げキャラクターを**『{name}』**に変更しました！",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.command(name="speaker")
 async def set_speaker_command(ctx: commands.Context, *, name: str = None):
     if not name or name not in SPEAKERS:
         speaker_list_str = "\n".join([f"・{k}" for k in list(SPEAKERS.keys())[:10]])
-        await ctx.send(f"使い方: `!speaker <キャラ名>`\n例: `!speaker ずんだもん（あまあま）`\n\n【指定可能なキャラ例（抜粋）】\n{speaker_list_str}\n...他多数")
+        embed = discord.Embed(
+            title="設定方法",
+            description=f"使い方: `!speaker <キャラ名>`\n例: `!speaker ずんだもん（あまあま）`\n\n【指定可能なキャラ例（抜粋）】\n{speaker_list_str}\n...他多数",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
         return
 
     speaker_id = SPEAKERS[name]
     user_speaker_map[ctx.author.id] = speaker_id
-    await ctx.send(f"読み上げキャラクターを**『{name}』**に変更しました！")
+    
+    embed = discord.Embed(
+        title="キャラクター変更完了",
+        description=f"読み上げキャラクターを**『{name}』**に変更しました！",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
 
 
 # --- テキスト・スラッシュコマンド ---
@@ -294,16 +360,16 @@ async def set_speaker_command(ctx: commands.Context, *, name: str = None):
 async def join_command(ctx: commands.Context):
     if not ctx.guild or not isinstance(ctx.author, discord.Member):
         return
-    res = await join_vc_logic(ctx.author, ctx.guild)
-    await ctx.send(res)
+    embed = await join_vc_logic(ctx.author, ctx.guild)
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="leave")
 async def leave_command(ctx: commands.Context):
     if not ctx.guild:
         return
-    res = await leave_vc_logic(ctx.guild)
-    await ctx.send(res)
+    embed = await leave_vc_logic(ctx.guild)
+    await ctx.send(embed=embed)
 
 
 @bot.tree.command(name="join", description="実行者が参加しているボイスチャンネルに参加します")
@@ -311,8 +377,8 @@ async def join_slash(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
         return
-    res = await join_vc_logic(interaction.user, interaction.guild)
-    await interaction.response.send_message(res)
+    embed = await join_vc_logic(interaction.user, interaction.guild)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="leave", description="ボイスチャンネルから切断します")
@@ -320,8 +386,8 @@ async def leave_slash(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
         return
-    res = await leave_vc_logic(interaction.guild)
-    await interaction.response.send_message(res)
+    embed = await leave_vc_logic(interaction.guild)
+    await interaction.response.send_message(embed=embed)
 
 
 if __name__ == "__main__":
