@@ -186,7 +186,7 @@ async def on_ready():
         logger.exception("Failed to sync app commands: %s", e)
 
 
-# --- メッセージ受信・自動読み上げ処理 ---
+# --- メッセージ受信・自動読み上げ処理（メモリリーク対策済み） ---
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -204,9 +204,18 @@ async def on_message(message: discord.Message):
                 try:
                     source = discord.FFmpegPCMAudio(audio_stream, pipe=True)
                     if not voice_client.is_playing():
-                        voice_client.play(source)
+                        def after_playing(error):
+                            if error:
+                                logger.error("再生エラー: %s", error)
+                            source.cleanup()
+                            audio_stream.close()
+
+                        voice_client.play(source, after=after_playing)
+                    else:
+                        audio_stream.close()
                 except Exception as e:
                     logger.exception("音声再生に失敗しました: %s", e)
+                    audio_stream.close()
 
     await bot.process_commands(message)
 
