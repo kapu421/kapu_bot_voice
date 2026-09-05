@@ -1,9 +1,11 @@
-import os
-import logging
-import sys
+import asyncio
 import io
-import aiohttp
+import json
+import logging
+import os
+import sys
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -37,9 +39,13 @@ proxy_to_use = PROXY_URL if (USE_PROXY and PROXY_URL) else None
 
 if USE_PROXY:
     if PROXY_URL:
-        logger.info("HTTP/HTTPSプロキシ経由でDiscordに接続します: %s", PROXY_URL)
+        logger.info(
+            "HTTP/HTTPSプロキシ経由でDiscordに接続します: %s", PROXY_URL
+        )
     else:
-        logger.warning("USE_PROXY=true ですが PROXY_URL が設定されていないため、プロキシなしで起動します。")
+        logger.warning(
+            "USE_PROXY=true ですが PROXY_URL が設定されていないため、プロキシなしで起動します。"
+        )
 else:
     logger.info("プロキシなしでDiscordに接続します。")
 
@@ -98,10 +104,40 @@ SPEAKERS = {
     "ナースロボ＿タイプＴ（内緒話）": 50,
 }
 
-user_speaker_map = {}
+# --- 設定ファイルの保存・読み込み処理 ---
+DATA_FILE = "user_speakers.json"
+
+
+def load_user_speakers() -> dict[int, int]:
+    """JSONファイルからユーザーの設定を読み込む"""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except Exception as e:
+            logger.error(f"設定ファイルの読み込み失敗: {e}")
+    return {}
+
+
+def save_user_speakers():
+    """ユーザーの設定をJSONファイルに保存する"""
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_speaker_map, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"設定ファイルの保存失敗: {e}")
+
+
+user_speaker_map = load_user_speakers()
+
+# ギルドごとの再生キューとワーカータスク管理
+speech_queues: dict[int, asyncio.Queue] = {}
+speech_tasks: dict[int, asyncio.Task] = {}
 
 
 class MyBot(commands.Bot):
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.session: aiohttp.ClientSession | None = None
@@ -125,15 +161,17 @@ bot = MyBot(
 
 # --- VOICEVOX 接続チェック ---
 
+
 async def check_voicevox_status() -> bool:
     """VOICEVOX (ngrok) が起動しているか確認する関数"""
     if not VOICEVOX_URL or not bot.session:
         return False
-    
+
     headers = {"ngrok-skip-browser-warning": "true"}
     try:
-        # バージョン確認用APIを叩いて接続確認
-        async with bot.session.get(f"{VOICEVOX_URL}/version", headers=headers, timeout=5) as resp:
+        async with bot.session.get(
+            f"{VOICEVOX_URL}/version", headers=headers, timeout=5
+        ) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -141,9 +179,12 @@ async def check_voicevox_status() -> bool:
 
 # --- VOICEVOX 音声生成処理 ---
 
+
 async def generate_voice(text: str, speaker_id: int) -> io.BytesIO | None:
     if not VOICEVOX_URL or not bot.session:
-        logger.error("VOICEVOX_URL または ClientSession が正しく準備されていません。")
+        logger.error(
+            "VOICEVOX_URL または ClientSession が正しく準備されていません。"
+        )
         return None
 
     headers = {"ngrok-skip-browser-warning": "true"}
@@ -152,7 +193,7 @@ async def generate_voice(text: str, speaker_id: int) -> io.BytesIO | None:
         async with bot.session.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"text": text, "speaker": speaker_id},
-            headers=headers
+            headers=headers,
         ) as resp:
             if resp.status != 200:
                 logger.error("VOICEVOX Audio Query Failed: %s", resp.status)
@@ -163,17 +204,55 @@ async def generate_voice(text: str, speaker_id: int) -> io.BytesIO | None:
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": speaker_id},
             json=query_data,
-            headers=headers
+            headers=headers,
         ) as resp:
             if resp.status != 200:
                 logger.error("VOICEVOX Synthesis Failed: %s", resp.status)
                 return None
             voice_bytes = await resp.read()
             return io.BytesIO(voice_bytes)
-            
+
     except Exception as e:
         logger.exception("VOICEVOX との通信に失敗しました: %s", e)
         return None
+
+
+# --- 再生キューワーカー ---
+
+
+async def play_queue_worker(guild_id: int, voice_client: discord.VoiceClient):
+    """キューに入った文章を順次再生するワーカー"""
+    queue = speech_queues[guild_id]
+    try:
+        while voice_client.is_connected():
+            text, speaker_id = await queue.get()
+
+            audio_stream = await generate_voice(text, speaker_id)
+            if audio_stream:
+                loop = asyncio.get_running_loop()
+                play_done = loop.create_future()
+
+                def after_playing(error):
+                    if error:
+                        logger.error("再生エラー: %s", error)
+                    if not play_done.done():
+                        loop.call_soon_threadsafe(play_done.set_result, None)
+
+                try:
+                    source = discord.FFmpegPCMAudio(audio_stream, pipe=True)
+                    voice_client.play(source, after=after_playing)
+                    await play_done
+                except Exception as e:
+                    logger.exception("音声再生に失敗しました: %s", e)
+                finally:
+                    audio_stream.close()
+
+            queue.task_done()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        speech_queues.pop(guild_id, None)
+        speech_tasks.pop(guild_id, None)
 
 
 @bot.event
@@ -186,44 +265,57 @@ async def on_ready():
         logger.exception("Failed to sync app commands: %s", e)
 
 
-# --- メッセージ受信・自動読み上げ処理（メモリリーク対策済み） ---
+# --- メッセージ受信・自動読み上げ処理 ---
+
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.content.startswith("!"):
         return
 
-    voice_client = message.guild.voice_client if message.guild else None
+    voice_client = (
+        message.guild.voice_client
+        if message.guild
+        else None
+    )
 
     if voice_client and voice_client.is_connected():
-        if message.author.voice and message.author.voice.channel.id == voice_client.channel.id:
-            speaker_id = user_speaker_map.get(message.author.id, 3)
-            
-            audio_stream = await generate_voice(message.content, speaker_id)
-            if audio_stream:
-                try:
-                    source = discord.FFmpegPCMAudio(audio_stream, pipe=True)
-                    if not voice_client.is_playing():
-                        def after_playing(error):
-                            if error:
-                                logger.error("再生エラー: %s", error)
-                            source.cleanup()
-                            audio_stream.close()
+        if (
+            message.author.voice
+            and message.author.voice.channel.id == voice_client.channel.id
+        ):
+            speaker_id = user_speaker_map.get(
+                message.author.id, 3
+            )  # デフォルト: ずんだもん(ノーマル)
+            guild_id = message.guild.id
 
-                        voice_client.play(source, after=after_playing)
-                    else:
-                        audio_stream.close()
-                except Exception as e:
-                    logger.exception("音声再生に失敗しました: %s", e)
-                    audio_stream.close()
+            if guild_id not in speech_queues:
+                speech_queues[guild_id] = asyncio.Queue()
+
+            if (
+                guild_id not in speech_tasks
+                or speech_tasks[guild_id].done()
+            ):
+                speech_tasks[guild_id] = asyncio.create_task(
+                    play_queue_worker(guild_id, voice_client)
+                )
+
+            await speech_queues[guild_id].put(
+                (message.content, speaker_id)
+            )
 
     await bot.process_commands(message)
 
 
 # --- 自動切断処理 ---
 
+
 @bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+):
     voice_state = before if before.channel else after
     if not voice_state or not voice_state.channel:
         return
@@ -235,32 +327,36 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if voice_client and voice_client.channel.id == channel.id:
         human_members = [m for m in channel.members if not m.bot]
         if len(human_members) == 0:
+            if guild.id in speech_tasks:
+                speech_tasks[guild.id].cancel()
             await voice_client.disconnect()
-            logger.info(f"チャンネル『{channel.name}』から全員が退出したため、Botが自動切断しました。")
+            logger.info(
+                f"チャンネル『{channel.name}』から全員が退出したため、Botが自動切断しました。"
+            )
 
 
 # --- VC参加・切断の共通処理（Embed生成） ---
 
-async def join_vc_logic(member: discord.Member, guild: discord.Guild) -> discord.Embed:
+
+async def join_vc_logic(
+    member: discord.Member, guild: discord.Guild
+) -> discord.Embed:
     if not member.voice or not member.voice.channel:
-        embed = discord.Embed(
+        return discord.Embed(
             title="エラー",
             description="先にボイスチャンネルに入ってからコマンドを実行してください。",
-            color=discord.Color.red()
+            color=discord.Color.red(),
         )
-        return embed
 
     target_channel = member.voice.channel
 
-    # VOICEVOX ngrokの起動チェック
     is_vv_active = await check_voicevox_status()
     if not is_vv_active:
-        embed = discord.Embed(
+        return discord.Embed(
             title="VOICEVOX接続エラー",
             description="VOICEVOX.NGROKが実行されていません。\n開発者(kapu)に連絡してください。",
-            color=discord.Color.red()
+            color=discord.Color.red(),
         )
-        return embed
 
     voice_client = guild.voice_client
 
@@ -269,21 +365,21 @@ async def join_vc_logic(member: discord.Member, guild: discord.Guild) -> discord
             embed = discord.Embed(
                 title="ボイスチャンネル参加",
                 description=f"すでに『{target_channel.name}』に参加しています。",
-                color=discord.Color.blue()
+                color=discord.Color.blue(),
             )
         else:
             await voice_client.move_to(target_channel)
             embed = discord.Embed(
                 title="ボイスチャンネル移動",
                 description=f"『{target_channel.name}』に移動しました！",
-                color=discord.Color.blue()
+                color=discord.Color.blue(),
             )
     else:
         await target_channel.connect()
         embed = discord.Embed(
             title="ボイスチャンネル参加",
             description=f"『{target_channel.name}』に参加しました！",
-            color=discord.Color.blue()
+            color=discord.Color.blue(),
         )
 
     return embed
@@ -292,23 +388,27 @@ async def join_vc_logic(member: discord.Member, guild: discord.Guild) -> discord
 async def leave_vc_logic(guild: discord.Guild) -> discord.Embed:
     voice_client = guild.voice_client
     if voice_client:
+        if guild.id in speech_tasks:
+            speech_tasks[guild.id].cancel()
+
         channel_name = voice_client.channel.name
         await voice_client.disconnect()
         embed = discord.Embed(
             title="ボイスチャンネル終了",
             description=f"『{channel_name}』から切断しました。",
-            color=discord.Color.blue()
+            color=discord.Color.blue(),
         )
     else:
         embed = discord.Embed(
             title="エラー",
             description="ボットはどのボイスチャンネルにも参加していません。",
-            color=discord.Color.red()
+            color=discord.Color.red(),
         )
     return embed
 
 
 # --- 声（キャラクター）変更機能 ---
+
 
 async def speaker_autocomplete(
     interaction: discord.Interaction,
@@ -322,20 +422,25 @@ async def speaker_autocomplete(
     return choices[:25]
 
 
-@bot.tree.command(name="speaker", description="読み上げ音声のキャラクターを変更します")
+@bot.tree.command(
+    name="speaker", description="読み上げ音声のキャラクターを変更します"
+)
 @app_commands.autocomplete(name=speaker_autocomplete)
 async def set_speaker_slash(interaction: discord.Interaction, name: str):
     if name not in SPEAKERS:
-        await interaction.response.send_message("指定されたキャラクターが見つかりません。", ephemeral=True)
+        await interaction.response.send_message(
+            "指定されたキャラクターが見つかりません。", ephemeral=True
+        )
         return
 
     speaker_id = SPEAKERS[name]
     user_speaker_map[interaction.user.id] = speaker_id
-    
+    save_user_speakers()  # JSONファイルへ書き込み・永続化
+
     embed = discord.Embed(
         title="キャラクター変更完了",
         description=f"読み上げキャラクターを**『{name}』**に変更しました！",
-        color=discord.Color.blue()
+        color=discord.Color.blue(),
     )
     await interaction.response.send_message(embed=embed)
 
@@ -343,27 +448,31 @@ async def set_speaker_slash(interaction: discord.Interaction, name: str):
 @bot.command(name="speaker")
 async def set_speaker_command(ctx: commands.Context, *, name: str = None):
     if not name or name not in SPEAKERS:
-        speaker_list_str = "\n".join([f"・{k}" for k in list(SPEAKERS.keys())[:10]])
+        speaker_list_str = "\n".join(
+            [f"・{k}" for k in list(SPEAKERS.keys())[:10]]
+        )
         embed = discord.Embed(
             title="設定方法",
             description=f"使い方: `!speaker <キャラ名>`\n例: `!speaker ずんだもん（あまあま）`\n\n【指定可能なキャラ例（抜粋）】\n{speaker_list_str}\n...他多数",
-            color=discord.Color.orange()
+            color=discord.Color.orange(),
         )
         await ctx.send(embed=embed)
         return
 
     speaker_id = SPEAKERS[name]
     user_speaker_map[ctx.author.id] = speaker_id
-    
+    save_user_speakers()  # JSONファイルへ書き込み・永続化
+
     embed = discord.Embed(
         title="キャラクター変更完了",
         description=f"読み上げキャラクターを**『{name}』**に変更しました！",
-        color=discord.Color.blue()
+        color=discord.Color.blue(),
     )
     await ctx.send(embed=embed)
 
 
 # --- テキスト・スラッシュコマンド ---
+
 
 @bot.command(name="join")
 async def join_command(ctx: commands.Context):
@@ -381,10 +490,17 @@ async def leave_command(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="join", description="実行者が参加しているボイスチャンネルに参加します")
+@bot.tree.command(
+    name="join",
+    description="実行者が参加しているボイスチャンネルに参加します",
+)
 async def join_slash(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    if not interaction.guild or not isinstance(
+        interaction.user, discord.Member
+    ):
+        await interaction.response.send_message(
+            "サーバー内で実行してください。", ephemeral=True
+        )
         return
     embed = await join_vc_logic(interaction.user, interaction.guild)
     await interaction.response.send_message(embed=embed)
@@ -393,7 +509,9 @@ async def join_slash(interaction: discord.Interaction):
 @bot.tree.command(name="leave", description="ボイスチャンネルから切断します")
 async def leave_slash(interaction: discord.Interaction):
     if not interaction.guild:
-        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        await interaction.response.send_message(
+            "サーバー内で実行してください。", ephemeral=True
+        )
         return
     embed = await leave_vc_logic(interaction.guild)
     await interaction.response.send_message(embed=embed)
